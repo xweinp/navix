@@ -269,3 +269,16 @@ def test_symbolic_first_person_shows_the_pocket():
         carrying[own_cell],
         jnp.asarray([EntityIds.KEY, PALETTE.YELLOW, 0], dtype=jnp.uint8),
     )
+
+
+def test_categorical_first_person_shows_the_pocket():
+    # the pocket is reported at the player's own cell or not at all, so
+    # without this nothing in the observation says the key was picked up.
+    empty = nx.observations.categorical_first_person(occluded_room_state())
+    carrying = nx.observations.categorical_first_person(
+        occluded_room_state(pocket=jnp.asarray(3))
+    )
+    own_cell = (2 * nx.observations.RADIUS, nx.observations.RADIUS)
+
+    assert empty[own_cell] == EntityIds.PLAYER
+    assert carrying[own_cell] == EntityIds.KEY

@@ -218,7 +218,12 @@ def categorical_first_person(state: State) -> Array:
     to a `(2 * RADIUS + 1)` square around the player and rotated so the
     player sits at the bottom-centre facing up. Cells occluded by a wall,
     outside MiniGrid's visibility rule, or off the map are set to `0`
-    (`EntityIds.UNKNOWN`, not seen).
+    (`EntityIds.UNKNOWN`, not seen). The player's own cell reports what it
+    is carrying (`pocket_symbol`), as MiniGrid's `gen_obs_grid` does, and
+    falls back to `PLAYER` when the pocket is empty - a free cell reads
+    `0` in this encoding, the same value as "not seen", so writing
+    MiniGrid's empty cell there would hide the player's own position
+    instead of marking it.
 
     Args:
         state (State): the current state.
@@ -241,6 +246,15 @@ def categorical_first_person(state: State) -> Array:
     # get categorical representation
     tags = state.get_tags()
     obs = state.grid.at[row, col].set(tags, mode="drop")
+
+    # the pocket is reported at the player's own cell, and nowhere else,
+    # so this is all that says the key has been picked up. An empty
+    # pocket leaves the PLAYER tag standing (see the docstring).
+    pocket = pocket_symbol(state)[0].astype(obs.dtype)
+    carrying = state.get_player().pocket != EMPTY_POCKET_ID
+    obs = obs.at[tuple(player.position.T)].set(
+        jnp.where(carrying, pocket, obs[tuple(player.position.T)])
+    )
 
     # Mask after the crop so crop()'s off-map padding (100, not an
     # EntityId, outside the Discrete(MAX_CATEGORICAL_VALUE) space this
