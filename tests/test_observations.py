@@ -206,3 +206,66 @@ if __name__ == "__main__":
     test_categorical_first_person_stays_inside_its_space()
     # test_categorical_first_person()
     # jax.jit(test_categorical_first_person)()
+
+
+def occluded_room_state(pocket=EMPTY_POCKET_ID):
+    """A room split by a wall stub, with a key behind it and one in hand."""
+    height, width = 10, 10
+    grid = jnp.zeros((height - 2, width - 2), dtype=jnp.int32)
+    grid = jnp.pad(grid, 1, mode="constant", constant_values=-1)
+    # a wall the player's line of sight cannot round, and a goal behind it
+    grid = grid.at[1:5, 3].set(-1)
+
+    player = Player(
+        position=jnp.asarray((1, 1)), direction=jnp.asarray(0), pocket=pocket
+    )
+    goal = Goal.create(position=jnp.asarray((1, 4)), probability=jnp.asarray(1.0))
+    key = Key(position=jnp.asarray((5, 5)), id=jnp.asarray(3), colour=PALETTE.YELLOW)
+    entities = {
+        Entities.PLAYER: player[None],
+        Entities.GOAL: goal[None],
+        Entities.KEY: key[None],
+    }
+    return State(
+        key=jax.random.PRNGKey(0),
+        grid=grid,
+        cache=RenderingCache.init(grid),
+        entities=entities,
+    )
+
+
+def test_symbolic_first_person_hides_what_the_player_cannot_see():
+    # symbolic_first_person applied no visibility mask at all, so the
+    # player read the whole cropped window through walls - unlike
+    # categorical_first_person and rgb_first_person, which mask with
+    # MiniGrid's process_vis.
+    state = occluded_room_state()
+
+    obs = nx.observations.symbolic_first_person(state)
+    view = nx.observations.first_person_vis(state)
+
+    assert not jnp.any(obs[..., 0] == EntityIds.GOAL), (
+        "Expected the goal behind the wall to be hidden, got:\n{}".format(obs[..., 0])
+    )
+    assert jnp.any(obs[..., 0] == EntityIds.UNKNOWN)
+    # every unseen cell, and only those, reads MiniGrid's "unseen" symbol
+    assert jnp.array_equal(jnp.all(obs == 0, axis=-1), ~view)
+
+
+def test_symbolic_first_person_shows_the_pocket():
+    # MiniGrid's gen_obs_grid writes the carried object into the player's
+    # own cell; navix wrote FLOOR there, so nothing in the observation
+    # said what - or whether - the player was carrying.
+    empty = nx.observations.symbolic_first_person(occluded_room_state())
+    carrying = nx.observations.symbolic_first_person(
+        occluded_room_state(pocket=jnp.asarray(3))
+    )
+    own_cell = (2 * nx.observations.RADIUS, nx.observations.RADIUS)
+
+    assert jnp.array_equal(
+        empty[own_cell], jnp.asarray([EntityIds.FLOOR, 0, 0], dtype=jnp.uint8)
+    )
+    assert jnp.array_equal(
+        carrying[own_cell],
+        jnp.asarray([EntityIds.KEY, PALETTE.YELLOW, 0], dtype=jnp.uint8),
+    )

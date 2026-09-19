@@ -53,7 +53,14 @@ import jax.numpy as jnp
 from jax import Array
 
 from .rendering.cache import TILE_SIZE, unflatten_patches
-from .components import DISCARD_PILE_IDX, Directional, HasColour, Openable
+from .components import (
+    DISCARD_PILE_IDX,
+    EMPTY_POCKET_ID,
+    Directional,
+    HasColour,
+    Openable,
+    Pickable,
+)
 from .states import State
 from .grid import (
     apply_minigrid_opacity,
@@ -126,6 +133,86 @@ def categorical(state: State) -> Array:
     return grid.reshape(shape)
 
 
+def first_person_vis(state: State) -> Array:
+    """Which cells of the first-person window the player can see.
+
+    The transparency map is built in world coordinates - free cells and
+    transparent entities let sight through, everything else blocks it -
+    then cropped to the egocentric window, which is the frame MiniGrid's
+    `Grid.process_vis` is defined in. `padding_value=0` reads off-map as
+    opaque, so sight cannot leave the map and come back.
+
+    Args:
+        state (State): the current state.
+
+    Returns:
+        Array: `bool[2 * RADIUS + 1, 2 * RADIUS + 1]`, the visibility
+        mask over the cropped window."""
+    transparency_map = jnp.where(state.grid == 0, 1, 0)
+    positions = state.get_positions()
+    transparent = state.get_transparency()
+    # a picked-up entity's position (DISCARD_PILE_COORDS = (0, -1)) is
+    # off-grid - .at[].set()'s default mode wraps negative components
+    # around (numpy semantics) rather than dropping them, silently
+    # marking a real cell with the carried item's transparency. Push
+    # off-grid positions to be explicitly out of bounds first, so
+    # mode="drop" discards those writes instead.
+    H, W = state.grid.shape
+    row, col = positions[..., 0], positions[..., 1]
+    on_grid = (row >= 0) & (row < H) & (col >= 0) & (col < W)
+    row = jnp.where(on_grid, row, H)
+    col = jnp.where(on_grid, col, W)
+    transparency_map = transparency_map.at[row, col].set(transparent, mode="drop")
+
+    player = state.get_player()
+    window = crop(
+        transparency_map, player.position, player.direction, RADIUS, padding_value=0
+    )
+    return process_vis(window > 0)
+
+
+def pocket_symbol(state: State) -> Array:
+    """The `(tag, colour, state)` triple for the player's own cell.
+
+    MiniGrid's `gen_obs_grid` writes whatever the player is carrying into
+    its own cell of the observation, and an empty cell when it carries
+    nothing - the pocket is not reported anywhere else, so this is the
+    only thing that says "you picked the key up".
+
+    Args:
+        state (State): the current state.
+
+    Returns:
+        Array: `u8[3]`, the carried entity's symbol, or the floor
+        symbol when the pocket is empty."""
+    pocket = state.get_player().pocket
+    symbol = jnp.asarray([EntityIds.FLOOR, 0, 0], dtype=jnp.uint8)
+    for entity_class in state.entities:
+        entity = state.entities[entity_class]
+        if not isinstance(entity, Pickable):
+            continue
+        held = (entity.id == pocket) & (pocket != EMPTY_POCKET_ID)
+        if isinstance(entity, HasColour):
+            colour = jnp.asarray(entity.colour, dtype=jnp.int32)
+        else:
+            colour = jnp.zeros_like(entity.id)
+        # a carried object is never a door, so its state channel is 0,
+        # exactly as MiniGrid's `WorldObj.encode` leaves it.
+        carried = jnp.stack(
+            [
+                jnp.asarray(entity.tag, dtype=jnp.int32),
+                colour,
+                jnp.zeros_like(colour),
+            ],
+            axis=-1,
+        )
+        # only one entity can be in the pocket, so the max over instances
+        # is that entity's symbol, and zeros when this class holds none.
+        chosen = jnp.max(jnp.where(held[..., None], carried, 0), axis=0)
+        symbol = jnp.where(jnp.any(held), chosen.astype(jnp.uint8), symbol)
+    return symbol
+
+
 def categorical_first_person(state: State) -> Array:
     """The egocentric version of `categorical`: one tag per cell, cropped
     to a `(2 * RADIUS + 1)` square around the player and rotated so the
@@ -138,32 +225,18 @@ def categorical_first_person(state: State) -> Array:
 
     Returns:
         Array: `i32[2 * RADIUS + 1, 2 * RADIUS + 1]`."""
-    # get transparency map
-    transparency_map = jnp.where(state.grid == 0, 1, 0)
-    positions = state.get_positions()
-    transparent = state.get_transparency()
-    # a picked-up entity's position (DISCARD_PILE_COORDS = (0, -1)) is
-    # off-grid - .at[].set()'s default mode wraps negative components
-    # around (numpy semantics) rather than dropping them, silently
-    # overwriting a real cell (see categorical()/symbolic() for the
-    # same bug, fixed the same way). Push off-grid positions to be
-    # explicitly out of bounds first, so mode="drop" discards those
-    # writes instead.
+    view = first_person_vis(state)
+
+    # a picked-up entity's position is off-grid; push it out of bounds so
+    # mode="drop" discards the write rather than wrapping it onto a real
+    # cell (see first_person_vis).
     H, W = state.grid.shape
+    positions = state.get_positions()
     row, col = positions[..., 0], positions[..., 1]
     on_grid = (row >= 0) & (row < H) & (col >= 0) & (col < W)
     row = jnp.where(on_grid, row, H)
     col = jnp.where(on_grid, col, W)
-    transparency_map = transparency_map.at[row, col].set(transparent, mode="drop")
-
-    # process_vis is defined on the egocentric window, so crop first and
-    # mask the crop. padding_value=0 reads off-grid as opaque, so sight
-    # cannot leave the map and come back.
     player = state.get_player()
-    window = crop(
-        transparency_map, player.position, player.direction, RADIUS, padding_value=0
-    )
-    view = process_vis(window > 0)
 
     # get categorical representation
     tags = state.get_tags()
@@ -230,23 +303,24 @@ def symbolic(state: State) -> Array:
 def symbolic_first_person(state: State) -> Array:
     """The egocentric version of `symbolic`: the `(tag, colour, state)`
     triple per cell, cropped to a `(2 * RADIUS + 1)` square around the
-    player and rotated so the player faces up. Out-of-view / occluded
-    cells are filled with the wall symbol; the player's own cell shows
-    what it is carrying.
+    player and rotated so the player faces up. Cells occluded by a wall
+    or outside MiniGrid's visibility rule read `(UNKNOWN, 0, 0)`, the
+    "not seen" symbol MiniGrid's `Grid.encode` writes; off-map cells that
+    are in sight read as walls, as MiniGrid's padded slice does. The
+    player's own cell shows what it is carrying (`pocket_symbol`).
 
     Args:
         state (State): the current state.
 
     Returns:
         Array: `u8[2 * RADIUS + 1, 2 * RADIUS + 1, 3]`."""
-    # get transparency map
     obs = symbolic(state)
 
-    # replace player with pocket to show them what they are carrying
+    # the player's own cell reports the pocket, not the player: MiniGrid
+    # puts the carried object there and nothing else in the observation
+    # says what is being carried.
     player = state.get_player()
-    obs = obs.at[tuple(player.position.T)].set(
-        jnp.asarray([EntityIds.FLOOR, 0, 0], dtype=jnp.uint8)
-    )
+    obs = obs.at[tuple(player.position.T)].set(pocket_symbol(state))
 
     # crop to first person view
     obs = crop(
@@ -259,7 +333,14 @@ def symbolic_first_person(state: State) -> Array:
     # replace padding symbol with walls
     wall_symbol = jnp.array([EntityIds.WALL, 5, 0], dtype=jnp.uint8)
     obs = jnp.where(obs == 255, wall_symbol, obs)
-    return obs
+
+    # Mask after the crop, as the other first-person observations do, so
+    # the off-map padding above is hidden wherever the player has no line
+    # of sight to it - otherwise the maze boundary reads through a nearer
+    # wall.
+    view = first_person_vis(state)
+    unknown_symbol = jnp.zeros(3, dtype=jnp.uint8)
+    return jnp.where(view[..., None], obs, unknown_symbol)
 
 
 def rgb(state: State) -> Array:
@@ -338,17 +419,10 @@ def rgb_first_person(state: State) -> Array:
     # has equal R/G/B, so a scalar broadcasts across (..., 3) for both the
     # jnp.where fill and crop()'s padding_value.
     dark_cell_colour = apply_minigrid_opacity(jnp.asarray(100, dtype=jnp.uint8))
-    transparency_map = jnp.where(state.grid == 0, 1, 0)  # (H, W)
-    positions = state.get_positions()
-    transparent = state.get_transparency()
-    transparency_map = transparency_map.at[tuple(positions.T)].set(transparent)
-    # process_vis is defined on the egocentric window, so crop first and
-    # mask the crop, which also keeps the jnp.where below off the full
-    # (H, W, TILE, TILE, 3) patchwork.
-    window = crop(
-        transparency_map, player.position, player.direction, RADIUS, padding_value=0
-    )
-    view = process_vis(window > 0)  # (RADIUS * 2 + 1, RADIUS * 2 + 1)
+    # process_vis is defined on the egocentric window, so first_person_vis
+    # crops before masking, which also keeps the jnp.where below off the
+    # full (H, W, TILE, TILE, 3) patchwork.
+    view = first_person_vis(state)  # (RADIUS * 2 + 1, RADIUS * 2 + 1)
 
     # crop grid to agent's view
     patchwork = crop(
