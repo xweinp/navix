@@ -660,3 +660,36 @@ if __name__ == "__main__":
     test_walkable()
     test_pickup()
     # test_open()
+
+
+def test_pickup_is_a_noop_with_a_full_pocket():
+    # MiniGrid picks up only when `self.carrying is None`. navix
+    # overwrote the pocket, which discarded the held key off-grid: it was
+    # then gone from the observation, unreachable by `drop`, and the door
+    # it opened could never be unlocked.
+    height, width = 5, 5
+    grid = jnp.zeros((height - 2, width - 2), dtype=jnp.int32)
+    grid = jnp.pad(grid, pad_width=1, mode="constant", constant_values=1)
+    held, on_the_floor = 1, 2
+    player = nx.entities.Player(
+        position=jnp.asarray((1, 1)),
+        direction=jnp.asarray(0),
+        pocket=jnp.asarray(held),
+    )
+    keys = nx.entities.Key(
+        position=jnp.asarray((1, 2)),
+        id=jnp.asarray(on_the_floor),
+        colour=PALETTE.YELLOW,
+    )
+    state = State(
+        key=jax.random.PRNGKey(0),
+        grid=grid,
+        cache=nx.rendering.cache.RenderingCache.init(grid),
+        entities={Entities.PLAYER: player[None], Entities.KEY: keys[None]},
+    )
+
+    state = nx.actions.pickup(state)
+
+    assert int(state.get_player().pocket) == held
+    # the key in front stays on the grid, and nothing was discarded
+    assert jnp.array_equal(state.get_keys().position[0], jnp.asarray((1, 2)))

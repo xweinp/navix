@@ -204,8 +204,11 @@ def left(state: State) -> State:
 def pickup(state: State) -> State:
     """Picks up the pickable entity (`Key`, `Box`, or `Ball`) directly in
     front of the player: the entity is moved off the grid and its `id` is
-    written to `player.pocket`, overwriting whatever was there. No-op if
-    the cell in front holds nothing pickable. Records a pickup event.
+    written to `player.pocket`. No-op if the cell in front holds nothing
+    pickable, or if the pocket is already full - MiniGrid's `pickup`
+    carries one object at a time (`if self.carrying is None`), and
+    overwriting instead stranded the held item off-grid, unreachable by
+    `drop` and gone from every observation. Records a pickup event.
 
     Args:
         state (State): the current state.
@@ -239,7 +242,13 @@ def pickup(state: State) -> State:
         player = state.get_player(idx=0)
         position_in_front = translate(player.position, player.direction)
 
-        found = positions_equal(position_in_front, entity.position)
+        # an occupied pocket blocks the pickup entirely: no event, no
+        # discard, no overwrite. `pickup` handles each pickable type in
+        # turn and re-reads the player each time, so a pickup made here
+        # also blocks the types handled after it.
+        found = positions_equal(position_in_front, entity.position) & (
+            player.pocket == EMPTY_POCKET_ID
+        )
 
         # update events - before entity is moved to the discard pile
         # below, so the recorded event keeps the item's real pickup
