@@ -335,16 +335,40 @@ def drop(state: State) -> State:
 
 
 def toggle(state: State) -> State:
-    """MiniGrid's `toggle` action. An alias for `open`: in navix a door,
-    once opened, stays open (there is no close), so "toggle" and "open"
-    are the same operation.
+    """MiniGrid's `toggle` action: flips whatever is in front of the
+    player. A `Box` is opened (see `open_box`); a closed `Door` is opened
+    when it is unlocked or the player carries the key it requires (see
+    `open`); an **open** `Door` is closed again, which is what separates
+    this from `open` and what MiniGrid's `Door.toggle` does.
+
+    Closing takes no key and records no event - only opening does.
 
     Args:
         state (State): the current state.
 
     Returns:
-        State: see `open`."""
-    return open(state)
+        State: the state with the thing in front toggled."""
+    if Entities.DOOR not in state.entities:
+        return open(state)
+
+    player = state.get_player(idx=0)
+    position_in_front = translate(player.position, player.direction)
+    doors = state.get_doors()
+    # read before `open` runs: a door it opens this step must not be
+    # closed again by the same action.
+    was_open = positions_equal(position_in_front, doors.position) & jnp.asarray(
+        doors.open, dtype=jnp.bool_
+    )
+
+    state = open(state)
+
+    # `doors.open`'s dtype (int or bool, depending on the environment that
+    # built the door) is preserved through jnp.where's weak-type
+    # promotion, as in `open`; jax.lax.switch needs every action branch to
+    # agree on it.
+    doors = state.get_doors()
+    doors = doors.replace(open=jnp.where(was_open, False, doors.open))
+    return state.set_doors(doors)
 
 
 def open_box(state: State, position_in_front: Array) -> State:
@@ -395,7 +419,7 @@ def open(state: State) -> State:
       consumed from the pocket. Opening records a door-opening event.
 
     A `Door` that is already open, and any other cell, are left
-    untouched. `toggle` is an alias for this.
+    untouched - unlike `toggle`, which closes an open door.
 
     Args:
         state (State): the current state.

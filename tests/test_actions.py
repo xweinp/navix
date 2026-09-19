@@ -660,3 +660,60 @@ if __name__ == "__main__":
     test_walkable()
     test_pickup()
     # test_open()
+
+
+def door_in_front_state(open_value, requires=-1, pocket=EMPTY_POCKET_ID):
+    """A player at (1, 2) facing a door at (1, 3)."""
+    height, width = 5, 5
+    grid = jnp.zeros((height - 2, width - 2), dtype=jnp.int32)
+    grid = jnp.pad(grid, pad_width=1, mode="constant", constant_values=1)
+    player = nx.entities.Player(
+        position=jnp.asarray((1, 2)),
+        direction=jnp.asarray(0),
+        pocket=jnp.asarray(pocket),
+    )
+    doors = nx.entities.Door(
+        position=jnp.asarray((1, 3)),
+        requires=jnp.asarray(requires),
+        open=open_value,
+        colour=PALETTE.YELLOW,
+    )
+    return State(
+        key=jax.random.PRNGKey(0),
+        grid=grid,
+        cache=nx.rendering.cache.RenderingCache.init(grid),
+        entities={Entities.PLAYER: player[None], Entities.DOOR: doors[None]},
+    )
+
+
+def test_toggle_closes_an_open_door():
+    # MiniGrid's Door.toggle flips the door: `self.is_open = not
+    # self.is_open`. navix aliased toggle to open, so a door could never
+    # be closed again and MINIGRID_ACTION_SET's action 5 was not
+    # MiniGrid's action 5.
+    state = door_in_front_state(jnp.asarray(True))
+
+    state = nx.actions.toggle(state)
+
+    assert not bool(state.get_doors().open[0])
+
+
+def test_toggle_opens_a_closed_door_like_open():
+    state = door_in_front_state(jnp.asarray(False))
+
+    assert bool(nx.actions.toggle(state).get_doors().open[0])
+    assert bool(nx.actions.open(state).get_doors().open[0])
+
+
+def test_toggle_leaves_a_locked_door_shut_without_the_key():
+    state = door_in_front_state(jnp.asarray(False), requires=1)
+
+    assert not bool(nx.actions.toggle(state).get_doors().open[0])
+
+
+def test_toggle_preserves_door_dtype():
+    # see test_open_preserves_door_dtype: jax.lax.switch needs every
+    # action branch to agree on `open`'s dtype.
+    state = door_in_front_state(jnp.asarray(1, dtype=jnp.int32))
+
+    assert nx.actions.toggle(state).get_doors().open.dtype == jnp.int32
