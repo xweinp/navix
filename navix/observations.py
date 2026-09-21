@@ -106,8 +106,8 @@ def none(state: State) -> Array:
 
 def categorical(state: State) -> Array:
     """The whole grid as one integer per cell: the tag of whatever entity
-    occupies it (`0` for empty floor, `-1`-marked walls become their tag
-    via `entities.EntityIds`), fully observable.
+    occupies it (`0` for empty floor, `EntityIds.WALL` for the walls
+    `state.grid` marks `-1`), fully observable.
 
     Args:
         state (State): the current state.
@@ -128,9 +128,23 @@ def categorical(state: State) -> Array:
     # overwriting a real cell. Push negative indices to be explicitly
     # out of bounds first, so mode="drop" discards those writes instead.
     indices = jnp.where(indices < 0, num_cells, indices)
-    grid = state.grid.reshape(-1).at[indices].set(tags, mode="drop")
+    grid = grid_tags(state).reshape(-1).at[indices].set(tags, mode="drop")
     # unflatten patches to reconstruct the grid
     return grid.reshape(shape)
+
+def grid_tags(state: State) -> Array:
+    """`state.grid` with its walls (`-1`) written as `EntityIds.WALL` and
+    free cells left at `0`, the base layer the categorical observations
+    write entity tags over.
+
+    Args:
+        state (State): the current state.
+
+    Returns:
+        Array: `i32[H, W]`."""
+    wall = EntityIds.WALL.astype(state.grid.dtype)
+    return jnp.where(state.grid == -1, wall, state.grid)
+
 
 
 def first_person_vis(state: State) -> Array:
@@ -176,8 +190,7 @@ def pocket_symbol(state: State) -> Array:
 
     MiniGrid's `gen_obs_grid` writes whatever the player is carrying into
     its own cell of the observation, and an empty cell when it carries
-    nothing - the pocket is not reported anywhere else, so this is the
-    only thing that says "you picked the key up".
+    nothing.
 
     Args:
         state (State): the current state.
@@ -216,9 +229,9 @@ def pocket_symbol(state: State) -> Array:
 def categorical_first_person(state: State) -> Array:
     """The egocentric version of `categorical`: one tag per cell, cropped
     to a `(2 * RADIUS + 1)` square around the player and rotated so the
-    player sits at the bottom-centre facing up. Cells occluded by a wall,
-    outside MiniGrid's visibility rule, or off the map are set to `0`
-    (`EntityIds.UNKNOWN`, not seen). The player's own cell reports what it
+    player sits at the bottom-centre facing up. Cells occluded by a wall or
+    outside MiniGrid's visibility rule are set to `0` (`EntityIds.UNKNOWN`,
+    not seen); off-map cells in sight read as walls. The player's own cell reports what it
     is carrying (`pocket_symbol`), as MiniGrid's `gen_obs_grid` does, and
     falls back to `PLAYER` when the pocket is empty - a free cell reads
     `0` in this encoding, the same value as "not seen", so writing
@@ -245,21 +258,20 @@ def categorical_first_person(state: State) -> Array:
 
     # get categorical representation
     tags = state.get_tags()
-    obs = state.grid.at[row, col].set(tags, mode="drop")
+    obs = grid_tags(state).at[row, col].set(tags, mode="drop")
 
-    # the pocket is reported at the player's own cell, and nowhere else,
-    # so this is all that says the key has been picked up. An empty
-    # pocket leaves the PLAYER tag standing (see the docstring).
+    # the player's own cell reports the pocket, PLAYER when it is empty -
+    # written outright, since an open door under the player shares its
+    # cell and the scatter above keeps either tag
     pocket = pocket_symbol(state)[0].astype(obs.dtype)
     carrying = state.get_player().pocket != EMPTY_POCKET_ID
     obs = obs.at[tuple(player.position.T)].set(
-        jnp.where(carrying, pocket, obs[tuple(player.position.T)])
+        jnp.where(carrying, pocket, EntityIds.PLAYER.astype(obs.dtype))
     )
 
-    # Mask after the crop so crop()'s off-map padding (100, not an
-    # EntityId, outside the Discrete(MAX_CATEGORICAL_VALUE) space this
-    # observation declares) also becomes UNKNOWN (0).
-    obs = crop(obs, player.position, player.direction, RADIUS)
+    # off-map cells read as walls, as in MiniGrid's padded slice; the
+    # mask then hides whatever is out of sight.
+    obs = crop(obs, player.position, player.direction, RADIUS, int(EntityIds.WALL))
     obs = obs * view
 
     return obs
@@ -330,9 +342,7 @@ def symbolic_first_person(state: State) -> Array:
         Array: `u8[2 * RADIUS + 1, 2 * RADIUS + 1, 3]`."""
     obs = symbolic(state)
 
-    # the player's own cell reports the pocket, not the player: MiniGrid
-    # puts the carried object there and nothing else in the observation
-    # says what is being carried.
+    # the player's own cell reports the pocket, as in MiniGrid
     player = state.get_player()
     obs = obs.at[tuple(player.position.T)].set(pocket_symbol(state))
 
@@ -348,10 +358,7 @@ def symbolic_first_person(state: State) -> Array:
     wall_symbol = jnp.array([EntityIds.WALL, 5, 0], dtype=jnp.uint8)
     obs = jnp.where(obs == 255, wall_symbol, obs)
 
-    # Mask after the crop, as the other first-person observations do, so
-    # the off-map padding above is hidden wherever the player has no line
-    # of sight to it - otherwise the maze boundary reads through a nearer
-    # wall.
+    # mask after the crop so off-map walls out of sight read as unseen
     view = first_person_vis(state)
     unknown_symbol = jnp.zeros(3, dtype=jnp.uint8)
     return jnp.where(view[..., None], obs, unknown_symbol)

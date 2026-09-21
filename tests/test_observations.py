@@ -254,8 +254,7 @@ def test_symbolic_first_person_hides_what_the_player_cannot_see():
 
 def test_symbolic_first_person_shows_the_pocket():
     # MiniGrid's gen_obs_grid writes the carried object into the player's
-    # own cell; navix wrote FLOOR there, so nothing in the observation
-    # said what - or whether - the player was carrying.
+    # own cell, and an empty cell when nothing is carried.
     empty = nx.observations.symbolic_first_person(occluded_room_state())
     carrying = nx.observations.symbolic_first_person(
         occluded_room_state(pocket=jnp.asarray(3))
@@ -272,8 +271,7 @@ def test_symbolic_first_person_shows_the_pocket():
 
 
 def test_categorical_first_person_shows_the_pocket():
-    # the pocket is reported at the player's own cell or not at all, so
-    # without this nothing in the observation says the key was picked up.
+    # the player's own cell carries the pocket's tag, PLAYER when empty.
     empty = nx.observations.categorical_first_person(occluded_room_state())
     carrying = nx.observations.categorical_first_person(
         occluded_room_state(pocket=jnp.asarray(3))
