@@ -543,18 +543,17 @@ def test_open():
         doors.open, expected_open
     ), "Expected door open status {}, got {}".format(expected_open, doors.open)
 
-    # check that the key was consumed on unlocking
+    # the key stays in the pocket after unlocking, as in MiniGrid
     player = state.get_player()
     player.check_ndim(batched=False)
-    expected_pocket = EMPTY_POCKET_ID
+    expected_pocket = jnp.asarray(1)
     assert jnp.array_equal(
         player.pocket, expected_pocket
-    ), "Expected key to be consumed after unlocking, pocket to be {}, got {}".format(
+    ), "Expected the key to stay in the pocket, pocket to be {}, got {}".format(
         expected_pocket, player.pocket
     )
 
-    # check that opening an open door keeps it open, and does not touch the
-    # (already-empty) pocket again
+    # check that opening an open door keeps it open and leaves the pocket
     state = nx.actions.open(state)
     doors = state.get_doors()
     doors.check_ndim(batched=True)
@@ -618,42 +617,6 @@ def test_open_preserves_door_dtype():
     )
 
 
-def test_open_does_not_consume_key_for_already_open_door():
-    # KeyCorridor constructs its target door already `open` (truthy) while
-    # still `requires`-ing a key (locked) - a deliberate quirk of its
-    # design, not a state open() should treat as "just unlocked". Standing
-    # in front of such a door with the matching key must not destroy it,
-    # since nothing is actually being unlocked (the door is already open).
-    height, width = 5, 5
-    grid = jnp.zeros((height - 2, width - 2), dtype=jnp.int32)
-    grid = jnp.pad(grid, pad_width=1, mode="constant", constant_values=1)
-    key = jax.random.PRNGKey(0)
-    player = nx.entities.Player(
-        position=jnp.asarray((1, 1)), direction=jnp.asarray(0), pocket=jnp.asarray(1)
-    )
-    doors = nx.entities.Door(
-        position=jnp.asarray((1, 3)),
-        requires=jnp.asarray(1),
-        open=jnp.asarray(2),  # already open, mirrors KeyCorridor's construction
-        colour=PALETTE.YELLOW,
-    )
-    cache = nx.rendering.cache.RenderingCache.init(grid)
-    entities = {
-        Entities.PLAYER: player[None],
-        Entities.DOOR: doors[None],
-    }
-    state = State(key=key, grid=grid, cache=cache, entities=entities)
-
-    state = nx.actions.forward(state)  # move player to (1, 2), facing the door at (1, 3)
-    state = nx.actions.open(state)
-    player = state.get_player()
-    expected_pocket = jnp.asarray(1)
-    assert jnp.array_equal(player.pocket, expected_pocket), (
-        "Expected key to be left untouched for an already-open door, "
-        "pocket to be {}, got {}".format(expected_pocket, player.pocket)
-    )
-
-
 if __name__ == "__main__":
     # test_rotation()
     # test_move()
@@ -688,9 +651,7 @@ def door_in_front_state(open_value, requires=-1, pocket=EMPTY_POCKET_ID):
 
 def test_toggle_closes_an_open_door():
     # MiniGrid's Door.toggle flips the door: `self.is_open = not
-    # self.is_open`. navix aliased toggle to open, so a door could never
-    # be closed again and MINIGRID_ACTION_SET's action 5 was not
-    # MiniGrid's action 5.
+    # self.is_open`.
     state = door_in_front_state(jnp.asarray(True))
 
     state = nx.actions.toggle(state)
@@ -746,5 +707,5 @@ def test_pickup_is_a_noop_with_a_full_pocket():
     state = nx.actions.pickup(state)
 
     assert int(state.get_player().pocket) == held
-    # the key in front stays on the grid, and nothing was discarded
+    # the key in front stays on the grid
     assert jnp.array_equal(state.get_keys().position[0], jnp.asarray((1, 2)))

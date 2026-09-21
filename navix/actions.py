@@ -424,8 +424,9 @@ def open(state: State) -> State:
       cell (see `open_box`);
     - a `Door` -> opened iff it is closed and either unlocked
       (`requires == -1`) or the player is carrying the required key
-      (`player.pocket == door.requires`), in which case that key is
-      consumed from the pocket. Opening records a door-opening event.
+      (`player.pocket == door.requires`). The key stays in the pocket,
+      as in MiniGrid's `Door.toggle`. Opening records a door-opening
+      event.
 
     A `Door` that is already open, and any other cell, are left
     untouched - unlike `toggle`, which closes an open door.
@@ -468,18 +469,6 @@ def open(state: State) -> State:
     requires = jnp.where(do_open, -1, doors.requires)
     doors = doors.replace(open=open, requires=requires)
 
-    # remove key from player's pocket, but only when this action actually
-    # unlocked a previously-closed, locked door with a matching key - not
-    # merely because the door in front happened to already be open (some
-    # environments, e.g. KeyCorridor, construct a door that is already open
-    # while still marked locked; `do_open` is False there, so the key is
-    # correctly left untouched)
-    unlocked = do_open & locked & key_match
-    pocket = jnp.where(jnp.any(unlocked), EMPTY_POCKET_ID, player.pocket)
-    player = jax.lax.cond(
-        jnp.any(unlocked), lambda: player.replace(pocket=pocket), lambda: player
-    )
-
     # update events
     events = jax.lax.cond(
         jnp.any(do_open),
@@ -487,7 +476,6 @@ def open(state: State) -> State:
         lambda: state.events,
     )
 
-    state = state.set_player(player)
     state = state.set_doors(doors)
     state = state.set_events(events)
 
