@@ -22,8 +22,7 @@
 - every room stays reachable from the corridor, the locked room never gets
 a second (openable) connector, no two doors ever share a cell, every wall
 connect_all does not open is a real wall, and the number of doors follows
-MiniGrid's. #160 and #161 were both silent regressions of these invariants,
-so this checks them directly across many seeds rather than relying on luck."""
+MiniGrid's, checked directly across many seeds."""
 
 from typing import Optional, Set, Tuple
 
