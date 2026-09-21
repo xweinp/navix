@@ -38,8 +38,8 @@ Three encodings, shared by both families:
   `entities.EntityIds`); shape `(H, W)`.
 - **symbolic** - three integers per cell `(tag, colour, state)` as in
   MiniGrid; shape `(H, W, 3)`, `uint8`.
-- **rgb** - a rendered image, `uint8`, each cell a `TILE_SIZE x TILE_SIZE`
-  sprite; shape `(H * TILE_SIZE, W * TILE_SIZE, 3)`.
+- **rgb** - a rendered image, `uint8`, each cell MiniGrid's `TILE_SIZE x TILE_SIZE`
+  tile; shape `(H * TILE_SIZE, W * TILE_SIZE, 3)`.
 
 `Environment` infers the matching `observation_space` for these built-in
 functions; a custom `observation_fn` needs `observation_space` passed
@@ -52,9 +52,9 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from .rendering.cache import TILE_SIZE, unflatten_patches
+from .rendering import minigrid_tiles
+from .rendering.cache import TILE_SIZE
 from .components import (
-    DISCARD_PILE_IDX,
     EMPTY_POCKET_ID,
     Directional,
     HasColour,
@@ -63,13 +63,12 @@ from .components import (
 )
 from .states import State
 from .grid import (
-    apply_minigrid_opacity,
     align,
     idx_from_coordinates,
     crop,
     process_vis,
 )
-from .entities import EntityIds
+from .entities import Entities, EntityIds
 
 
 RADIUS = 3
@@ -132,6 +131,7 @@ def categorical(state: State) -> Array:
     # unflatten patches to reconstruct the grid
     return grid.reshape(shape)
 
+
 def grid_tags(state: State) -> Array:
     """`state.grid` with its walls (`-1`) written as `EntityIds.WALL` and
     free cells left at `0`, the base layer the categorical observations
@@ -144,7 +144,6 @@ def grid_tags(state: State) -> Array:
         Array: `i32[H, W]`."""
     wall = EntityIds.WALL.astype(state.grid.dtype)
     return jnp.where(state.grid == -1, wall, state.grid)
-
 
 
 def first_person_vis(state: State) -> Array:
@@ -290,6 +289,13 @@ def symbolic(state: State) -> Array:
 
     Returns:
         Array: `u8[H, W, 3]` (`H = env.height`, `W = env.width`)."""
+    return encode_grid(state, with_player=True)
+
+
+def encode_grid(state: State, with_player: bool) -> Array:
+    """`symbolic`'s encoding, optionally leaving the player out, so the
+    cell under it reads what it stands on - which is what MiniGrid draws
+    the agent over in `rgb`."""
     # initialise as all floors
     H, W = state.grid.shape
     obs = jnp.zeros((H, W, 3), dtype=jnp.uint8)
@@ -299,6 +305,8 @@ def symbolic(state: State) -> Array:
 
     # place entities
     for entity_class in state.entities:
+        if entity_class == Entities.PLAYER and not with_player:
+            continue
         entity = state.entities[entity_class]
         # 1. tag layer
         tag = entity.tag
@@ -365,9 +373,11 @@ def symbolic_first_person(state: State) -> Array:
 
 
 def rgb(state: State) -> Array:
-    """The whole grid rendered as an RGB image, fully observable. Each
-    cell is a `TILE_SIZE x TILE_SIZE` sprite (walls, floor grid lines,
-    entities) drawn from `state.cache`.
+    """The whole grid rendered as an RGB image, fully observable - the
+    frame MiniGrid's `RGBImgObsWrapper` returns. Each cell is MiniGrid's
+    own tile for its symbolic encoding (`rendering.minigrid_tiles`), the
+    player drawn in its real direction over what it stands on, and the
+    cells `rgb_first_person` would show highlighted.
 
     Args:
         state (State): the current state.
@@ -375,86 +385,72 @@ def rgb(state: State) -> Array:
     Returns:
         Array: `u8[H * TILE_SIZE, W * TILE_SIZE, 3]` (`H = env.height`,
         `W = env.width`)."""
-    # get idx of entity on the flat set of patches
-    indices = idx_from_coordinates(state.grid, state.get_positions())
-    # get tiles corresponding to the entities
-    tiles = state.get_sprites()
-    # set tiles on the flat set of patches
-    patches = state.cache.patches.at[indices].set(tiles)
-    # remove discard pile
-    patches = patches[:DISCARD_PILE_IDX]
-    # unflatten patches to reconstruct the image
-    image_size = (
-        state.grid.shape[0] * TILE_SIZE,
-        state.grid.shape[1] * TILE_SIZE,
+    symbols = encode_grid(state, with_player=False).astype(jnp.int32)
+    player = state.get_player()
+    agent = jnp.zeros(symbols.shape[:2], dtype=jnp.int32)
+    agent = agent.at[tuple(player.position)].set(1 + player.direction)
+    table = jnp.asarray(minigrid_tiles.tiles(TILE_SIZE))
+    highlight = world_vis(state).astype(jnp.int32)
+    return tile_image(
+        table[agent, highlight, symbols[..., 0], symbols[..., 1], symbols[..., 2]]
     )
-    image = unflatten_patches(patches, image_size)
-    return image
+
+
+def world_vis(state: State) -> Array:
+    """`first_person_vis` carried back to world coordinates: which cells
+    of the grid the player can see. Each cell's own `(row, col)` is
+    cropped with the same window, so the scatter needs no inverse of the
+    rotation.
+
+    Args:
+        state (State): the current state.
+
+    Returns:
+        Array: `bool[H, W]`."""
+    H, W = state.grid.shape
+    rows, cols = jnp.meshgrid(jnp.arange(H), jnp.arange(W), indexing="ij")
+    player = state.get_player()
+    coords = crop(
+        jnp.stack([rows, cols], axis=-1),
+        player.position,
+        player.direction,
+        RADIUS,
+        padding_value=-1,
+    )
+    # off-map and unseen cells are pushed out of bounds, so mode="drop"
+    # discards them
+    seen = first_person_vis(state) & (coords[..., 0] >= 0)
+    row = jnp.where(seen, coords[..., 0], H)
+    col = jnp.where(seen, coords[..., 1], W)
+    return jnp.zeros((H, W), dtype=jnp.bool_).at[row, col].set(True, mode="drop")
+
+
+def tile_image(patchwork: Array) -> Array:
+    """`(rows, cols, TILE_SIZE, TILE_SIZE, 3)` tiles laid out as one image."""
+    obs = jnp.swapaxes(patchwork, 1, 2)
+    shape = obs.shape
+    return obs.reshape(shape[0] * shape[1], shape[2] * shape[3], *shape[4:])
 
 
 def rgb_first_person(state: State) -> Array:
-    """The egocentric version of `rgb`: the rendered image cropped to a
-    `(2 * RADIUS + 1)`-tile square around the player and rotated so the
-    player faces up. Out-of-view / occluded tiles are filled with the
-    dimmed "unseen" grey.
+    """The egocentric RGB view MiniGrid's `RGBImgPartialObsWrapper` returns:
+    `symbolic_first_person` drawn with MiniGrid's own tiles
+    (`rendering.minigrid_tiles`). Visible cells are highlighted, unseen
+    ones are the dark empty tile, and the player is drawn facing up over
+    whatever it carries.
 
     Args:
         state (State): the current state.
 
     Returns:
         Array: `u8[(2 * RADIUS + 1) * TILE_SIZE, (2 * RADIUS + 1) * TILE_SIZE, 3]`."""
-    # get the player
-    player = state.get_player()
-
-    # get sprites aligned to player's direction
-    sprites = state.get_sprites_first_person()  # (n_sprites, TILE_SIZE, TILE_SIZE, 3)
-    # sprites = jax.vmap(lambda x: align(x, jnp.asarray(0), alignment_direction))(sprites)
-
-    # Grid lines are drawn once on the floor tile in
-    # rendering/cache.py's render_background(), not here - `sprites` is
-    # per-entity (player, keys, balls, doors, ...), and MiniGrid's own
-    # grid lines are drawn under objects, not over them (Wall.render()
-    # fully covers its tile, so grid lines never show through walls
-    # either). Drawing lines directly on these entity sprites would
-    # incorrectly overlay a line across their artwork instead.
-
-    # update current patchwork
-    indices = idx_from_coordinates(state.grid, state.get_positions())
-    patches = state.cache.patches.at[indices].set(
-        sprites
-    )  # ( H * W + 1, TILE_SIZE, TILE_SIZE, 3)
-
-    # remove discard pile
-    patches = patches[:DISCARD_PILE_IDX]  # ( H * W, TILE_SIZE, TILE_SIZE, 3)
-    # rearrange the sprites in a grid
-    patchwork = patches.reshape(
-        *state.grid.shape, *patches.shape[1:]
-    )  # (H, W, TILE_SIZE, TILE_SIZE, 3)
-
-    # apply minigrid opacity
-    patchwork = apply_minigrid_opacity(patchwork)
-
-    # Unseen and off-map tiles take the opacity-adjusted wall grey: every
-    # cell in `patchwork` went through apply_minigrid_opacity above, so a
-    # raw (100, 100, 100) fill would seam against real walls (~146). Grey
-    # has equal R/G/B, so a scalar broadcasts across (..., 3) for both the
-    # jnp.where fill and crop()'s padding_value.
-    dark_cell_colour = apply_minigrid_opacity(jnp.asarray(100, dtype=jnp.uint8))
-    # process_vis is defined on the egocentric window, so first_person_vis
-    # crops before masking, which also keeps the jnp.where below off the
-    # full (H, W, TILE, TILE, 3) patchwork.
-    view = first_person_vis(state)  # (RADIUS * 2 + 1, RADIUS * 2 + 1)
-
-    # crop grid to agent's view
-    patchwork = crop(
-        patchwork, player.position, player.direction, RADIUS, dark_cell_colour
-    )  # (RADIUS * 2 + 1, RADIUS * 2 + 1, TILE_SIZE, TILE_SIZE, 3)
-
-    # apply fov
-    patchwork = jnp.where(view[..., None, None, None], patchwork, dark_cell_colour)
-
-    # reconstruct image
-    obs = jnp.swapaxes(patchwork, 1, 2)
-    shape = obs.shape
-    obs = obs.reshape(shape[0] * shape[1], shape[2] * shape[3], *shape[4:])
-    return obs
+    symbols = symbolic_first_person(state).astype(jnp.int32)
+    # the player faces up (MiniGrid's direction 3) at the bottom centre
+    agent = jnp.zeros(symbols.shape[:2], dtype=jnp.int32).at[2 * RADIUS, RADIUS].set(4)
+    # an unseen cell is MiniGrid's untinted empty tile
+    seen = symbols[..., 0] != int(EntityIds.UNKNOWN)
+    kind = jnp.where(seen, symbols[..., 0], int(EntityIds.FLOOR))
+    table = jnp.asarray(minigrid_tiles.tiles(TILE_SIZE))
+    return tile_image(
+        table[agent, seen.astype(jnp.int32), kind, symbols[..., 1], symbols[..., 2]]
+    )
