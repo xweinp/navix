@@ -251,3 +251,103 @@ def test_door_count_matches_minigrid(env_id):
             f"{env_id}: {n} unlocked doors in {counts[n]:.3f} of resets, "
             f"MiniGrid {frequency:.3f}"
         )
+
+
+_LEGACY_IDS = tuple(env_id.replace("-v0", "-Legacy-v0") for env_id in _ENV_IDS)
+
+
+@pytest.mark.parametrize("env_id", _ENV_IDS)
+def test_standard_has_no_drop(env_id):
+    assert nx.actions.drop not in nx.make(env_id).action_set
+
+
+@pytest.mark.parametrize("env_id", _LEGACY_IDS)
+def test_legacy_keeps_minigrid_actions(env_id):
+    assert nx.make(env_id).action_set == nx.actions.MINIGRID_ACTION_SET
+
+
+@pytest.mark.parametrize("env_id", _ENV_IDS)
+def test_legacy_lays_out_like_standard_with_a_ball_target(env_id):
+    standard = nx.make(env_id)
+    legacy = nx.make(env_id.replace("-v0", "-Legacy-v0"))
+    for seed in range(20):
+        key = jax.random.PRNGKey(seed)
+        a = standard.reset(key).state
+        b = legacy.reset(key).state
+        np.testing.assert_array_equal(a.grid, b.grid)
+        for name in ("player", "key", "door"):
+            for x, y in zip(
+                jax.tree_util.tree_leaves(a.entities[name]),
+                jax.tree_util.tree_leaves(b.entities[name]),
+                strict=True,
+            ):
+                np.testing.assert_array_equal(x, y)
+        assert "ball" not in a.entities and "goal" not in b.entities
+        ball = b.get_balls()
+        np.testing.assert_array_equal(ball.position[0], a.get_goals().position[0])
+        np.testing.assert_array_equal(b.mission[0].position, ball.position[0])
+        np.testing.assert_array_equal(b.mission[0].colour, ball.colour[0])
+
+
+def _facing_ball(env, pocket_key: bool):
+    """The player west of the ball, facing it, with a free floor cell to its
+    north to drop into. Doors are cleared so nothing else occupies either."""
+    timestep = env.reset(jax.random.PRNGKey(0))
+    state = timestep.state
+    row, col = (int(x) for x in state.get_balls().position[0])
+    keys = state.get_keys()
+    state = state.set_player(
+        state.get_player().replace(
+            position=jnp.asarray([row, col - 1]),
+            direction=jnp.asarray(0),
+            pocket=keys.id[0] if pocket_key else jnp.asarray(EMPTY_POCKET_ID),
+        )
+    )
+    if pocket_key:
+        state = state.set_keys(
+            keys.replace(position=jnp.broadcast_to(DISCARD_PILE_COORDS, keys.position.shape))
+        )
+    doors = state.get_doors()
+    state = state.set_doors(
+        doors.replace(position=jnp.broadcast_to(DISCARD_PILE_COORDS, doors.position.shape))
+    )
+    grid = state.grid.at[row, col - 1].set(0).at[row - 1, col - 1].set(0)
+    return timestep.replace(state=state.replace(grid=grid))
+
+
+def _act(env, timestep, action):
+    return jax.jit(env.step)(timestep, jnp.asarray(env.action_set.index(action)))
+
+
+@pytest.mark.parametrize("env_id", _LEGACY_IDS)
+def test_legacy_ends_on_picking_up_the_ball(env_id):
+    env = nx.make(env_id)
+    result = _act(env, _facing_ball(env, pocket_key=False), nx.actions.pickup)
+    assert float(result.reward) == 1
+    assert bool(result.is_done())
+
+
+@pytest.mark.parametrize("env_id", _LEGACY_IDS)
+def test_legacy_needs_the_key_dropped_first(env_id):
+    # As in MiniGrid: unlocking keeps the key, and a full pocket blocks pickup.
+    env = nx.make(env_id)
+    timestep = _facing_ball(env, pocket_key=True)
+    timestep = _act(env, timestep, nx.actions.pickup)
+    assert float(timestep.reward) == 0 and not bool(timestep.is_done())
+    for action in (nx.actions.rotate_ccw, nx.actions.drop, nx.actions.rotate_cw):
+        timestep = _act(env, timestep, action)
+        assert float(timestep.reward) == 0 and not bool(timestep.is_done())
+    assert int(timestep.state.get_player().pocket) == EMPTY_POCKET_ID
+    timestep = _act(env, timestep, nx.actions.pickup)
+    assert float(timestep.reward) == 1
+    assert bool(timestep.is_done())
+
+
+@pytest.mark.parametrize("env_id", _LEGACY_IDS)
+def test_legacy_ball_stays_put(env_id):
+    env = nx.make(env_id)
+    timestep = env.reset(jax.random.PRNGKey(0))
+    start = timestep.state.get_balls().position
+    for _ in range(10):
+        timestep = _act(env, timestep, nx.actions.rotate_cw)
+        np.testing.assert_array_equal(timestep.state.get_balls().position, start)
