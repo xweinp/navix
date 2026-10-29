@@ -19,6 +19,14 @@
 
 """MiniGrid's KeyCorridor environment - find a key off a corridor to reach a locked room.
 
+Two variants share the layout. The standard `Navix-KeyCorridorS*R*-v0` puts a
+walkable `Goal` in the locked room and ends when the player steps onto it; it
+has no `drop`, since nothing in the task needs the pocket emptied. The
+`-Legacy-v0` ids are MiniGrid's original task: the target is a `Ball`, the
+episode ends when it is picked up, and since the key is still carried after
+unlocking (MiniGrid's `Door.toggle` keeps it) and the pocket holds one object,
+the key has to be dropped first - so these keep MiniGrid's full action set.
+
 See the environment class in this module for the task, layout and
 reward/termination details.
 """
@@ -32,13 +40,15 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from navix import observations, rewards, terminations
+from flax import struct
+
+from navix import actions, observations, rewards, terminations, transitions
 
 from ..components import DISCARD_PILE_COORDS, EMPTY_POCKET_ID
 from ..rendering.cache import RenderingCache
 from ..environments import Environment
-from ..entities import Goal, Player, Key, Door
-from ..states import State
+from ..entities import Ball, Goal, Player, Key, Door
+from ..states import Event, State
 from ..environments import Timestep
 from ..grid import random_colour, RoomsGrid
 from .registry import register_env
@@ -64,7 +74,14 @@ class KeyCorridor(Environment):
 
     `jax.jit` needs a fixed entity count, so every candidate wall is a `Door`;
     the ones left shut sit at `DISCARD_PILE_COORDS` and their cell stays a wall.
+
+    `legacy` swaps the `Goal` for MiniGrid's randomly-coloured `Ball`, tracked
+    as `state.mission` for `on_target_fetched`. Its colour is drawn off a key
+    folded from the goal-position key, so both variants lay out identically
+    for the same reset key.
     """
+
+    legacy: bool = struct.field(pytree_node=False, default=False)
 
     def _reset(self, key: Array, cache: Union[RenderingCache, None] = None) -> Timestep:
         n_rows_config = {3: 1, 5: 2}
@@ -90,7 +107,26 @@ class KeyCorridor(Environment):
         # goal
         goal_room_row = jax.random.randint(k_goal_row, (), minval=0, maxval=n_rows)
         goal_pos = grid.position_in_room(goal_room_row, jnp.asarray(2), key=k_goal_pos)
-        goal = Goal.create(goal_pos, probability=jnp.asarray(1.0))
+        if self.legacy:
+            target_colour = random_colour(jax.random.fold_in(k_goal_pos, 1))
+            target = {
+                "ball": Ball.create(
+                    goal_pos,
+                    target_colour,
+                    probability=jnp.asarray(1.0),
+                    id=jnp.asarray(2),
+                )[None]
+            }
+            mission = (
+                Event(
+                    position=goal_pos,
+                    colour=target_colour,
+                    happened=jnp.asarray(False),
+                ),
+            )
+        else:
+            target = {"goal": Goal.create(goal_pos, probability=jnp.asarray(1.0))[None]}
+            mission = ()
 
         # Doors: connect_all - see the class docstring. `parent` (union-find)
         # is kept fully flat as an invariant: a union from a flat state only
@@ -204,7 +240,7 @@ class KeyCorridor(Environment):
             "player": player[None],
             "key": key_obj[None],
             "door": doors,
-            "goal": goal[None],
+            **target,
         }
 
         state = State(
@@ -212,6 +248,7 @@ class KeyCorridor(Environment):
             grid=grid,
             cache=cache or RenderingCache.init(grid),
             entities=entities,
+            mission=mission,
         )
         return Timestep(
             t=jnp.asarray(0, dtype=jnp.int32),
@@ -223,75 +260,54 @@ class KeyCorridor(Environment):
         )
 
 
-register_env(
-    "Navix-KeyCorridorS3R1-v0",
-    lambda *args, **kwargs: KeyCorridor.create(
-        height=3,
-        width=7,
-        observation_fn=kwargs.pop("observation_fn", observations.symbolic),
-        reward_fn=kwargs.pop("reward_fn", rewards.on_goal_reached),
-        termination_fn=kwargs.pop("termination_fn", terminations.on_goal_reached),
-        *args,
-        **kwargs,
-    ),
+# MiniGrid's actions without `drop`: the standard task never needs the pocket
+# emptied, so the action only ever wasted a step. Indices after `pickup` shift
+# down by one relative to `MINIGRID_ACTION_SET`.
+ACTION_SET_WITHOUT_DROP = tuple(
+    a for a in actions.MINIGRID_ACTION_SET if a is not actions.drop
 )
-register_env(
-    "Navix-KeyCorridorS3R2-v0",
-    lambda *args, **kwargs: KeyCorridor.create(
-        height=5,
-        width=7,
-        observation_fn=kwargs.pop("observation_fn", observations.symbolic),
-        reward_fn=kwargs.pop("reward_fn", rewards.on_goal_reached),
-        termination_fn=kwargs.pop("termination_fn", terminations.on_goal_reached),
-        *args,
-        **kwargs,
-    ),
-)
-register_env(
-    "Navix-KeyCorridorS3R3-v0",
-    lambda *args, **kwargs: KeyCorridor.create(
-        height=7,
-        width=7,
-        observation_fn=kwargs.pop("observation_fn", observations.symbolic),
-        reward_fn=kwargs.pop("reward_fn", rewards.on_goal_reached),
-        termination_fn=kwargs.pop("termination_fn", terminations.on_goal_reached),
-        *args,
-        **kwargs,
-    ),
-)
-register_env(
-    "Navix-KeyCorridorS4R3-v0",
-    lambda *args, **kwargs: KeyCorridor.create(
-        height=10,
-        width=10,
-        observation_fn=kwargs.pop("observation_fn", observations.symbolic),
-        reward_fn=kwargs.pop("reward_fn", rewards.on_goal_reached),
-        termination_fn=kwargs.pop("termination_fn", terminations.on_goal_reached),
-        *args,
-        **kwargs,
-    ),
-)
-register_env(
-    "Navix-KeyCorridorS5R3-v0",
-    lambda *args, **kwargs: KeyCorridor.create(
-        height=13,
-        width=13,
-        observation_fn=kwargs.pop("observation_fn", observations.symbolic),
-        reward_fn=kwargs.pop("reward_fn", rewards.on_goal_reached),
-        termination_fn=kwargs.pop("termination_fn", terminations.on_goal_reached),
-        *args,
-        **kwargs,
-    ),
-)
-register_env(
-    "Navix-KeyCorridorS6R3-v0",
-    lambda *args, **kwargs: KeyCorridor.create(
-        height=16,
-        width=16,
-        observation_fn=kwargs.pop("observation_fn", observations.symbolic),
-        reward_fn=kwargs.pop("reward_fn", rewards.on_goal_reached),
-        termination_fn=kwargs.pop("termination_fn", terminations.on_goal_reached),
-        *args,
-        **kwargs,
-    ),
-)
+
+
+def _register(name: str, height: int, width: int) -> None:
+    register_env(
+        f"Navix-KeyCorridor{name}-v0",
+        lambda *args, **kwargs: KeyCorridor.create(
+            height=height,
+            width=width,
+            observation_fn=kwargs.pop("observation_fn", observations.symbolic),
+            reward_fn=kwargs.pop("reward_fn", rewards.on_goal_reached),
+            termination_fn=kwargs.pop("termination_fn", terminations.on_goal_reached),
+            action_set=kwargs.pop("action_set", ACTION_SET_WITHOUT_DROP),
+            *args,
+            **kwargs,
+        ),
+    )
+    register_env(
+        f"Navix-KeyCorridor{name}-Legacy-v0",
+        lambda *args, **kwargs: KeyCorridor.create(
+            height=height,
+            width=width,
+            legacy=True,
+            # the default transition walks every `Ball` around, as in
+            # DynamicObstacles; MiniGrid's target stays where it was placed
+            transitions_fn=kwargs.pop(
+                "transitions_fn", transitions.deterministic_transition
+            ),
+            observation_fn=kwargs.pop("observation_fn", observations.symbolic),
+            reward_fn=kwargs.pop("reward_fn", rewards.on_target_fetched),
+            termination_fn=kwargs.pop("termination_fn", terminations.on_target_fetched),
+            *args,
+            **kwargs,
+        ),
+    )
+
+
+for _name, _height, _width in (
+    ("S3R1", 3, 7),
+    ("S3R2", 5, 7),
+    ("S3R3", 7, 7),
+    ("S4R3", 10, 10),
+    ("S5R3", 13, 13),
+    ("S6R3", 16, 16),
+):
+    _register(_name, _height, _width)
